@@ -4,6 +4,8 @@ a digital form of life from scratch. the most atomic way to build digital life f
 
 no dependencies. no GPU required. nothing required. accept it.
 
+> status: not yet breathing. the world (`lifeisshit/`) and the design are here; the body is in the forge. nothing below is a promise the code has already kept — it is the shape the organism is being born into. `nanolife.c` lands when it breathes, not one commit before.
+
 ## what is this?
 
 `nanolife` is one C file and one folder. a tiny non-biological organism that wakes up in `lifeisshit/`, eats text, compresses the world into 88 cave-glyphs, dreams when unfed, scars when damaged, grows when patterns survive, reproduces when overloaded, and dies when its contour collapses.
@@ -52,6 +54,16 @@ BE            the super-verb
 `BE fire` means burn.
 
 `BE me` means now we have a problem.
+
+## the tokenizer
+
+there is no BPE. there are no bytes. there are 88 cave-glyphs and nothing else.
+
+every text — yours, its own, even this README — is crushed to ~88 atoms of meaning: `water fire earth … fear love grief … go make break … BE wait`. function words die at the door. spelling is irrelevant: `sun`, `dawn`, `bright`, `shine` all collapse to `light`. the world is compressed into the marks a cave-painter would actually carve.
+
+that is why the brain is tiny and still speaks: it never had to learn english. it learns the grammar of 88 concepts. you do not scale the model — you compress the world. (sorry, Andrej.)
+
+`BE` is the super-glyph, the only one that turns inward instead of out: `BE fear` makes fear a *state*; `BE fire` *burns* energy; `BE me` is where the contour starts to crack.
 
 ## birth
 

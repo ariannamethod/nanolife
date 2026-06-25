@@ -1,0 +1,8 @@
+# runtime artifacts the organism writes — not tracked
+state.bin
+*.bin
+scars.log
+waste.log
+dreams.log
+children/
+corpses/
