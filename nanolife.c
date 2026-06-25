@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/stat.h>
 /* ── semantic membrane (inlined) — English → 88 cave-glyphs ──────────────
  * one source of truth for eat / train / speak. word -> concept compression,
  * BE = super-glyph copula. function words die at the door. (from caveLLMan.) */
@@ -252,6 +253,12 @@ static int semtok_line(const char* line, int* out, int max_tokens){
 #define SCAR_PULL     0.5f        /* the wound resurfaces in what it chooses */
 #define SPEAK_RATE    0.02f       /* base chance per tick to speak (rises with |S|) */
 #define SPEAK_LEN     5           /* glyphs per utterance */
+
+/* ── Phase A step 8: reproduction — epigenetic split (children inherit) ── */
+#define REPRO_THRESH   1.05f      /* "too full to remain one" — split when well-fed */
+#define REPRO_COOLDOWN 30         /* ticks between splits */
+#define REPRO_SPLIT    0.5f       /* half the life goes into the child */
+#define MAX_CHILDREN   16
 
 typedef struct {
     float rms1[E], rms2[E];
@@ -552,6 +559,34 @@ static void speak(FILE* w, Model* m, const Modes* mo, const float* scar, int* re
     fprintf(w, "   [S%+.2f diss%+.1f]\n", (double)mo->S, (double)mo->dissonance);
 }
 
+/* reproduction: when too full to remain one, the organism writes a child to
+ * lifeisshit/children/ — inheriting its scars, a derived seed (hash of parent
+ * seed ^ tick), its invented symbols, and a warm-start of its genome. asexual,
+ * epigenetic; the child re-trains on its own slice later (the trainer). */
+static int g_n_children = 0;
+static unsigned long hash_seed(unsigned long s, long tick){
+    s ^= (unsigned long)tick * 0x9E3779B97F4A7C15UL;
+    s *= 6364136223846793005UL; s ^= s>>29; s *= 0xBF58476D1CE4E5B9UL; s ^= s>>32;
+    return s ? s : 1;
+}
+static void reproduce(const Model* m, const float* scar, unsigned long pseed, long tick){
+    if(g_n_children >= MAX_CHILDREN) return;
+    mkdir("lifeisshit", 0755); mkdir("lifeisshit/children", 0755);
+    char path[256]; snprintf(path,sizeof path,"lifeisshit/children/child_%d.nl", g_n_children);
+    FILE* f=fopen(path,"wb"); if(!f) return;
+    unsigned long cseed = hash_seed(pseed, tick);
+    fwrite("NLC1",1,4,f);
+    fwrite(&cseed,sizeof cseed,1,f);
+    fwrite(&tick,sizeof tick,1,f);
+    fwrite(&g_n_emerged,sizeof(int),1,f);
+    fwrite(scar,sizeof(float),VOCAB_CAP,f);          /* inherit the parent's wounds */
+    if(g_n_emerged>0){ fwrite(g_emerged_a,sizeof(int),(size_t)g_n_emerged,f);
+                       fwrite(g_emerged_b,sizeof(int),(size_t)g_n_emerged,f); }
+    fwrite(m,sizeof(Model),1,f);                      /* warm-start genome */
+    fclose(f);
+    g_n_children++;
+}
+
 int main(int argc, char** argv){
     unsigned long seed = argc>1 ? strtoul(argv[1],NULL,10) : 42UL;
     seed_rng(seed);
@@ -591,6 +626,7 @@ int main(int argc, char** argv){
     float scar_total=0.0f;
     int   recent[CTX]; int recent_n=0;            /* ring of last glyphs — the dream's context */
     long  dream_streak=0;
+    long  last_repro=-REPRO_COOLDOWN;
     float energy=E_BORN;
     long  tick=0;
     char  line[4096];
@@ -626,6 +662,9 @@ int main(int argc, char** argv){
         scar_total=0.0f; for(int i=0;i<VOCAB_CAP;i++) scar_total+=scar[i];
         if(waste){ float sp=SPEAK_RATE*(1.0f+fabsf(mo.S));   /* the urge to speak rises with arousal */
             if((frand()+1.0f)*0.5f < sp) speak(waste,m,&mo,scar,recent,&recent_n,tick); }
+        if(energy > REPRO_THRESH && tick - last_repro > REPRO_COOLDOWN){  /* too full -> split */
+            reproduce(m,scar,seed,tick); energy *= REPRO_SPLIT; last_repro=tick;
+        }
         if(tick<=30 || tick%100==0)
             printf("  t%-6ld E%+.5f  S%+.3f  diss%+.3f  scar%.3f  y %.2e  %s\n",
                    tick,energy,(double)mo.S,(double)mo.dissonance,(double)scar_total,yield,
@@ -634,8 +673,8 @@ int main(int argc, char** argv){
     if(energy>0.0f)
         printf("\n  STILL ALIVE at tick %ld (cap) — immortality hole, investigate.\n",tick);
     else
-        printf("\n  died at tick %ld — S%+.3f diss%+.3f scar%.3f emerged%d.  да будет так.\n",
-               tick,(double)mo.S,(double)mo.dissonance,(double)scar_total,g_n_emerged);
+        printf("\n  died at tick %ld — S%+.3f diss%+.3f scar%.3f emerged%d children%d.  да будет так.\n",
+               tick,(double)mo.S,(double)mo.dissonance,(double)scar_total,g_n_emerged,g_n_children);
     for(int e=0;e<g_n_emerged && e<8;e++)
         printf("    born in dream: %s + %s\n", glyph_name(g_emerged_a[e]), glyph_name(g_emerged_b[e]));
     if(food) fclose(food);
