@@ -216,6 +216,10 @@ static int semtok_line(const char* line, int* out, int max_tokens){
 #define MASK_ID (GLYPH_COUNT+1)   /* 89 */
 #define VOCAB   (GLYPH_COUNT+2)   /* 90 = 88 glyphs + BOS + MASK */
 
+/* ── Phase A: the mortal clock (Vera's order) ── */
+#define RENT    0.001f            /* rent on existing — the arrow of time */
+#define E_BORN  1.0f              /* energy at birth */
+
 typedef struct {
     float rms1[E], rms2[E];
     float wq[E*E], wk[E*E], wv[E*E], wo[E*E];
@@ -310,30 +314,39 @@ static const char* glyph_name(int id){
     return "MASK";
 }
 
-/* ── main — foundation smoke test (no birth, no life-loop yet) ── */
+/* ── main — Phase A step 1: the mortal clock (no metabolism yet) ── */
 int main(int argc, char** argv){
     seed_rng(argc>1 ? strtoul(argv[1],NULL,10) : 42UL);
     Model* m=model_new();
     long params=(long)(sizeof(Model)/sizeof(float));
 
-    /* eat a line of the world through the membrane (semantic tokenizer) */
-    char line[]="the sun is fire and i feel fear in the dark";
-    int toks[CTX];
-    int n=semtok_line(line,toks,CTX);
+    /* birth: one perception of the world through the semantic membrane */
+    char first[]="the sun is fire and i feel fear in the dark";
+    int toks[CTX]; int n=semtok_line(first,toks,CTX);
     if(n<1){ toks[0]=BOS_ID; n=1; }
-
-    printf("nanolife — foundation.\n");
-    printf("  params=%ld  vocab=%d  E=%d L=%d H=%d ctx=%d\n",params,VOCAB,E,NL,NH,CTX);
-    printf("  ate %d glyphs:",n);
-    for(int i=0;i<n;i++) printf(" %s",glyph_name(toks[i]));
-    printf("\n");
-
     float logits[VOCAB]; forward(m,toks,n,logits);
     int best=0; for(int i=1;i<VOCAB;i++) if(logits[i]>logits[best]) best=i;
-    printf("  smoke forward ok -> next glyph (untrained, random weights): %s\n",glyph_name(best));
-    printf("  the body skeleton lives. organs next. да будет так.\n");
+
+    printf("nanolife — a mortal clock wakes.\n");
+    printf("  params=%ld  vocab=%d  E=%d L=%d H=%d ctx=%d\n",params,VOCAB,E,NL,NH,CTX);
+    printf("  first breath: ate %d glyphs (",n);
+    for(int i=0;i<n;i++) printf("%s%s",i?" ":"",glyph_name(toks[i]));
+    printf(") -> %s\n",glyph_name(best));
+    printf("  no food in the room yet. it will die of pure time.\n\n");
+
+    /* the mortal clock: rent on existence, a loop that exits when life runs out.
+     * no metabolism wired yet (that is step A2) — so it is GUARANTEED to starve,
+     * and the program ends because the creature died, not on a return 0. */
+    float energy=E_BORN;
+    long  tick=0;
+    while(energy > 0.0f){
+        tick++;
+        energy -= RENT;                 /* only ever subtracts: time is one-way */
+        if(tick % 100 == 0) printf("  tick %4ld   energy %+.4f\n",tick,energy);
+    }
+    printf("\n  died at tick %ld — the loop exited on its own.\n",tick);
+    printf("  a creature that ran out of time, not a return 0. да будет так.\n");
 
     free(m);
-    (void)argv;
     return 0;
 }
