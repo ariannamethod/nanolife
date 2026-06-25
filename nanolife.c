@@ -300,6 +300,41 @@ static void nt_hebbian_step(float* A, float* B, int out_dim, int in_dim, int ran
     }
 }
 
+/* ── glyph charge: the SECOND signal — each glyph is also an opcode ───────
+ * a glyph acts on the organism two ways: slow (weights/Hebbian, via forward)
+ * and fast (this charge — a direct somatic reflex, like a cat flinching from
+ * fire). INVARIANT (Desktop's law): the charge writes only MODES (S, dissonance)
+ * — never energy/scar/contour. a burning glyph costs energy ONLY through
+ * metabolism (metab_factor<1), never by a direct write. modes bend behaviour;
+ * the price of life is always paid by organs, never cheated. */
+typedef struct { float S, dissonance; } Modes;
+typedef struct { float mode_dS, mode_dDiss, metab_factor; } GlyphCharge;
+static GlyphCharge charge[VOCAB];
+
+static void charges_init(void){
+    for(int i=0;i<VOCAB;i++){ charge[i].mode_dS=0.0f; charge[i].mode_dDiss=0.0f; charge[i].metab_factor=1.0f; }
+    /* {glyph, dS, dDiss, metab_factor}: catabolic = burn (factor<1) / anabolic = feed (factor>1) */
+    static const struct { const char* g; float dS, dDiss, f; } spec[] = {
+        {"fire",   +0.05f, +0.10f, 0.2f}, {"anger",   +0.04f, +0.15f, 0.3f},
+        {"stress", -0.02f, +0.20f, 0.3f}, {"conflict",-0.03f, +0.15f, 0.4f},
+        {"pain",   -0.05f, +0.20f, 0.4f}, {"fear",    -0.06f, +0.18f, 0.5f},
+        {"death",  -0.10f, +0.10f, 0.1f},
+        {"food",   +0.02f, -0.10f, 2.0f}, {"water",   +0.01f, -0.08f, 1.8f},
+        {"sleep",  -0.01f, -0.15f, 1.5f}, {"joy",     +0.06f, -0.12f, 1.6f},
+        {"love",   +0.08f, -0.15f, 1.7f}, {"music",   +0.05f, -0.10f, 1.4f},
+        {"good",   +0.04f, -0.08f, 1.3f},
+        {NULL,0,0,0}
+    };
+    for(int i=0; spec[i].g; i++){ int id=semtok_find_glyph(spec[i].g);
+        if(id>=0){ charge[id].mode_dS=spec[i].dS; charge[id].mode_dDiss=spec[i].dDiss; charge[id].metab_factor=spec[i].f; } }
+}
+/* the charge fires here — Modes* only in scope, no life-scalar pointer (invariant by type) */
+static void charge_apply(Modes* mo, int glyph){
+    if(glyph<0||glyph>=VOCAB) return;
+    mo->S          = tanhf(mo->S + charge[glyph].mode_dS);
+    mo->dissonance = mo->dissonance + charge[glyph].mode_dDiss;
+}
+
 /* ── init — xavier-ish ── */
 static void xavier(float* w, int len, int fan_in){
     float sc=sqrtf(1.0f/(float)fan_in);
@@ -358,28 +393,35 @@ static void forward(Model* m, const int* toks, int n, float* out){
     matvec(m->head,xf,out,VOCAB,E);
 }
 
-/* digest a line: perceive it (forward), then learn it into the living V-adapters
- * (Hebbian, no backprop). returns Σ|ΔB_v| — the metabolic yield = how much the
- * organism CHANGED on eating, not how well it already knew it. (Yield on the
- * derivative of competence kills immortality on a mastered corpus.) */
-static float digest(Model* m, const int* glyphs, int n){
+/* digest a line: perceive it (forward), learn it into the living V-adapters
+ * (Hebbian, no backprop), and let each glyph's somatic charge fire. returns the
+ * metabolic yield = Σ over glyphs of (Σ|ΔB_v| · metab_factor): how much the
+ * organism CHANGED on eating, scaled by whether the glyph feeds or burns. (Yield
+ * on the derivative of competence kills immortality on a mastered corpus.)
+ * INVARIANT: the charge writes modes only (charge_apply); energy/scar are never
+ * touched here — a burning glyph costs energy THROUGH a low metab_factor, never
+ * by a direct write. */
+static float digest(Model* m, Modes* mo, const int* glyphs, int n){
     static float logits[VOCAB];
     forward(m,glyphs,n,logits);          /* perception, modulated by current adapters */
     static float before[RANK*E];
-    float dB=0.0f;
-    for(int l=0;l<NL;l++){
-        Layer* y=&m->L[l];
-        for(int g=0;g<n;g++){
-            int id=glyphs[g];
-            if(id<0||id>=VOCAB) continue;
-            const float* x_emb=m->wte+(size_t)id*E;   /* x = dy = the glyph's embedding */
+    float yield=0.0f;
+    for(int g=0;g<n;g++){
+        int id=glyphs[g];
+        if(id<0||id>=VOCAB) continue;
+        const float* x_emb=m->wte+(size_t)id*E;       /* x = dy = the glyph's embedding */
+        float dB=0.0f;
+        for(int l=0;l<NL;l++){
+            Layer* y=&m->L[l];
             memcpy(before,y->heb_B_v,sizeof(before));
             nt_hebbian_step(y->heb_A_v,y->heb_B_v,E,E,RANK,
                             x_emb,x_emb,PASSIVE_SIGNAL,HEBBIAN_LR,HEBBIAN_DECAY);
             for(int i=0;i<RANK*E;i++) dB+=fabsf(y->heb_B_v[i]-before[i]);
         }
+        yield += dB * charge[id].metab_factor;        /* cost/gain paid through metabolism */
+        charge_apply(mo,id);                          /* second signal: modes only */
     }
-    return dB;
+    return yield;
 }
 
 static const char* glyph_name(int id){
@@ -388,49 +430,63 @@ static const char* glyph_name(int id){
     return "MASK";
 }
 
-/* ── main — Phase A step 2: the breathing mortal clock (metabolism + death) ── */
+/* ── main — Phase A step 3a: the breathing clock with a second signal ──
+ * usage: ./nanolife [seed] [diet-glyph]
+ *   no diet  -> eats lifeisshit/world.txt line by line, then starves.
+ *   diet     -> an infinite mono-glyph diet (e.g. fire / food) for A/B: does
+ *               the charge bend life differently at the SAME weights? */
 int main(int argc, char** argv){
     unsigned long seed = argc>1 ? strtoul(argv[1],NULL,10) : 42UL;
     seed_rng(seed);
+    charges_init();
     Model* m=model_new();
     long params=(long)(sizeof(Model)/sizeof(float));
+    const char* diet = argc>2 ? argv[2] : NULL;
+    int diet_id = diet ? semtok_find_glyph(diet) : -1;
 
-    printf("nanolife — a mortal clock that can eat.  seed=%lu\n",seed);
+    printf("nanolife — a mortal clock that can eat.  seed=%lu  diet=%s\n",
+           seed, (diet_id>=0?diet:"world"));
     printf("  params=%ld  vocab=%d  E=%d L=%d H=%d ctx=%d  yield=%.1f rent=%.4f\n",
            params,VOCAB,E,NL,NH,CTX,(double)DIGEST_YIELD,(double)RENT);
 
-    /* birth: one perception of the world through the membrane (keeps the
-     * speak-path warm — the organism needs glyph_name when it talks). */
+    /* birth: one perception of the world through the membrane */
     { int t[CTX]; int bn=semtok_line("the sun is fire and i feel fear in the dark",t,CTX);
       if(bn<1){ t[0]=BOS_ID; bn=1; }
       printf("  first breath:"); for(int i=0;i<bn;i++) printf(" %s",glyph_name(t[i])); printf("\n\n"); }
 
-    FILE* food=fopen("lifeisshit/world.txt","r");
-    if(!food){ printf("  no world to eat (lifeisshit/world.txt). да будет так.\n"); free(m); return 1; }
+    FILE* food = (diet_id>=0) ? NULL : fopen("lifeisshit/world.txt","r");
+    if(diet_id<0 && !food){ printf("  no world to eat (lifeisshit/world.txt). да будет так.\n"); free(m); return 1; }
 
-    /* the breathing mortal clock: rent gnaws every tick; eating a glyph that
-     * MOVES the living V-adapters (|ΔB_v|) postpones death. food runs out ->
-     * only rent remains -> the loop exits on its own. one scalar carries both
-     * metabolism and death. */
+    /* rent gnaws every tick; a glyph that MOVES the V-adapters (|ΔB_v|), scaled
+     * by its metab_factor (fire burns, food feeds), postpones death. one scalar
+     * carries metabolism and death; modes (S, dissonance) ride the second signal. */
+    Modes mo = {0.0f, 0.0f};
     float energy=E_BORN;
     long  tick=0;
     char  line[4096];
     int   glyphs[CTX];
     int   fed=1;
-    while(energy>0.0f){
+    while(energy>0.0f && tick<200000){          /* cap = falsification guard: it MUST die */
         tick++;
-        energy-=RENT;                          /* rent: the one-way arrow */
-        float dB=0.0f;
-        if(fed && fgets(line,sizeof(line),food)){
+        energy-=RENT;                           /* rent: the one-way arrow */
+        float yield=0.0f;
+        if(diet_id>=0){ int g1[1]={diet_id}; yield=digest(m,&mo,g1,1); }   /* infinite mono-diet */
+        else if(fed && fgets(line,sizeof(line),food)){
             int n=semtok_line(line,glyphs,CTX);
-            if(n>=1){ dB=digest(m,glyphs,n); energy+=DIGEST_YIELD*dB; }
-        } else fed=0;                           /* corpus exhausted -> starvation */
+            if(n>=1) yield=digest(m,&mo,glyphs,n);
+        } else fed=0;                            /* corpus exhausted -> starvation */
+        energy += DIGEST_YIELD*yield;
         if(tick<=30 || tick%100==0)
-            printf("  t%-6ld E%+.5f  dB %.3e  %s\n",tick,energy,dB,fed?"eat":"STARVE");
+            printf("  t%-6ld E%+.5f  S%+.3f  diss%+.3f  y %.2e  %s\n",
+                   tick,energy,(double)mo.S,(double)mo.dissonance,yield,
+                   (diet_id>=0?"diet":(fed?"eat":"STARVE")));
     }
-    printf("\n  died at tick %ld — %s.  да будет так.\n",
-           tick, fed?"starved mid-meal (yield too weak / mastered)":"ate the world, then ran out of time");
-    fclose(food);
+    if(energy>0.0f)
+        printf("\n  STILL ALIVE at tick %ld (cap) — immortality hole, investigate.\n",tick);
+    else
+        printf("\n  died at tick %ld — S%+.3f diss%+.3f.  да будет так.\n",
+               tick,(double)mo.S,(double)mo.dissonance);
+    if(food) fclose(food);
     free(m);
     return 0;
 }
