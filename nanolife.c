@@ -396,6 +396,7 @@ static void xavier(float* w, int len, int fan_in){
 }
 static Model* model_new(void){
     Model* m=(Model*)calloc(1,sizeof(Model));
+    if(!m){ fprintf(stderr,"nanolife: out of memory\n"); exit(1); }
     xavier(m->wte,VOCAB_CAP*E,E); xavier(m->wpe,CTX*E,E);
     float sr=0.02f/sqrtf(2.0f*NL);
     for(int l=0;l<NL;l++){
@@ -441,6 +442,7 @@ static void try_emerge(Model* m){            /* called ONLY in dream — birth a
 static void forward(Model* m, const int* toks, int n, float* out){
     static float x[CTX][E], xn[CTX][E], q[CTX][E], k[CTX][E], v[CTX][E], att[CTX][E], tmp[FFN];
     if(n>CTX) n=CTX;
+    if(n<1){ for(int i=0;i<VOCAB_CAP;i++) out[i]=0.0f; return; }  /* no context -> no logits (no OOB on x[n-1]) */
     for(int t=0;t<n;t++) for(int e=0;e<E;e++)
         x[t][e]=m->wte[(size_t)toks[t]*E+e]+m->wpe[(size_t)t*E+e];
     for(int l=0;l<NL;l++){
@@ -580,22 +582,25 @@ static unsigned long hash_seed(unsigned long s, long tick){
     s *= 6364136223846793005UL; s ^= s>>29; s *= 0xBF58476D1CE4E5B9UL; s ^= s>>32;
     return s ? s : 1;
 }
-static void reproduce(const Model* m, const float* scar, unsigned long pseed, long tick){
-    if(g_n_children >= MAX_CHILDREN) return;
+static int reproduce(const Model* m, const float* scar, unsigned long pseed, long tick){
+    if(g_n_children >= MAX_CHILDREN) return 0;
     mkdir("lifeisshit", 0755); mkdir("lifeisshit/children", 0755);
     char path[256]; snprintf(path,sizeof path,"lifeisshit/children/child_%d.nl", g_n_children);
-    FILE* f=fopen(path,"wb"); if(!f) return;
+    FILE* f=fopen(path,"wb"); if(!f) return 0;
     unsigned long cseed = hash_seed(pseed, tick);
-    fwrite("NLC1",1,4,f);
-    fwrite(&cseed,sizeof cseed,1,f);
-    fwrite(&tick,sizeof tick,1,f);
-    fwrite(&g_n_emerged,sizeof(int),1,f);
-    fwrite(scar,sizeof(float),VOCAB_CAP,f);          /* inherit the parent's wounds */
-    if(g_n_emerged>0){ fwrite(g_emerged_a,sizeof(int),(size_t)g_n_emerged,f);
-                       fwrite(g_emerged_b,sizeof(int),(size_t)g_n_emerged,f); }
-    fwrite(m,sizeof(Model),1,f);                      /* warm-start genome */
-    fclose(f);
+    int ok = 1;
+    ok &= (fwrite("NLC1",1,4,f)==4);
+    ok &= (fwrite(&cseed,sizeof cseed,1,f)==1);
+    ok &= (fwrite(&tick,sizeof tick,1,f)==1);
+    ok &= (fwrite(&g_n_emerged,sizeof(int),1,f)==1);
+    ok &= (fwrite(scar,sizeof(float),VOCAB_CAP,f)==(size_t)VOCAB_CAP);   /* inherit the parent's wounds */
+    if(g_n_emerged>0){ ok &= (fwrite(g_emerged_a,sizeof(int),(size_t)g_n_emerged,f)==(size_t)g_n_emerged);
+                       ok &= (fwrite(g_emerged_b,sizeof(int),(size_t)g_n_emerged,f)==(size_t)g_n_emerged); }
+    ok &= (fwrite(m,sizeof(Model),1,f)==1);                              /* warm-start genome */
+    ok &= (fclose(f)==0);
+    if(!ok) return 0;                                                    /* a truncated child is not born */
     g_n_children++;
+    return 1;
 }
 
 int main(int argc, char** argv){
@@ -675,10 +680,11 @@ int main(int argc, char** argv){
         scar_total=0.0f; for(int i=0;i<VOCAB_CAP;i++) scar_total+=scar[i];
         if(homeo_on){ mo.dissonance *= DISS_DECAY; mo.S -= S_RELAX*mo.S; }  /* regulate toward viability */
         if(fabsf(mo.S) >= S_DEATH){ contour_died=1; break; }               /* overwhelmed: the contour melts */
-        if(waste){ float sp=SPEAK_RATE*(1.0f+fabsf(mo.S));   /* the urge to speak rises with arousal */
+        if(waste && recent_n>0){ float sp=SPEAK_RATE*(1.0f+fabsf(mo.S));   /* urge rises with arousal; needs a self to speak from */
             if((frand()+1.0f)*0.5f < sp) speak(waste,m,&mo,scar,recent,&recent_n,tick); }
         if(energy > REPRO_THRESH && tick - last_repro > REPRO_COOLDOWN){  /* too full -> split */
-            reproduce(m,scar,seed,tick); energy *= REPRO_SPLIT; last_repro=tick;
+            if(reproduce(m,scar,seed,tick)) energy *= REPRO_SPLIT;        /* pay only for a real child */
+            last_repro=tick;
         }
         if(tick<=30 || tick%100==0)
             printf("  t%-6ld E%+.5f  S%+.3f  diss%+.3f  scar%.3f  y %.2e  %s\n",
