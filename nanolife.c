@@ -220,10 +220,18 @@ static int semtok_line(const char* line, int* out, int max_tokens){
 #define RENT    0.001f            /* rent on existing — the arrow of time */
 #define E_BORN  1.0f              /* energy at birth */
 
+/* ── Phase A step 2: metabolism — living Hebbian-V plasticity (the fuel) ── */
+#define RANK           4          /* low-rank Hebbian LoRA (canon cavellman.c:43) */
+#define HEBBIAN_LR     0.001f     /* canon cavellman.c:423 */
+#define HEBBIAN_DECAY  0.9999f    /* canon cavellman.c:424 */
+#define PASSIVE_SIGNAL 0.3f       /* reading the world = passive (cavellman.c:654) */
+#define DIGEST_YIELD   80.0f      /* energy per unit |ΔB_v| — calibrated: avg dB~2e-5, break-even~50 */
+
 typedef struct {
     float rms1[E], rms2[E];
     float wq[E*E], wk[E*E], wv[E*E], wo[E*E];
     float fc1[FFN*E], fc2[E*FFN];
+    float heb_A_v[E*RANK], heb_B_v[RANK*E]; /* living Hebbian LoRA on V — runtime δ */
 } Layer;
 
 typedef struct {
@@ -241,6 +249,11 @@ static float frand(void){ /* ~U(-1,1) */
     g_rng = g_rng*6364136223846793005UL + 1442695040888963407UL;
     return ((float)((g_rng>>33)&0x7fffffff)/(float)0x40000000) - 1.0f;
 }
+static float gauss(float mu, float sigma){ /* Box-Muller on frand — deterministic by seed */
+    float u1=(frand()+1.0f)*0.5f, u2=(frand()+1.0f)*0.5f;
+    if(u1<1e-7f) u1=1e-7f;
+    return mu + sigma*sqrtf(-2.0f*logf(u1))*cosf(6.2831853f*u2);
+}
 
 /* ── primitives — naive, no BLAS (на крошечном matvec наив быстрее launch-ового BLAS) ── */
 static void matvec(const float* W, const float* x, float* y, int out_dim, int in_dim){
@@ -253,6 +266,39 @@ static void rmsnorm(const float* x, const float* g, float* y, int n){
     for(int i=0;i<n;i++) y[i]=x[i]*r*g[i];
 }
 static float silu(float v){ return v/(1.0f+expf(-v)); }
+
+/* ── Hebbian LoRA (vendored byte-faithful from caveLLMan, no backprop) ──
+ * apply: out += B @ (A @ x).  cavellman.c:511  (A:[dim×rank], B:[rank×dim]). */
+static void apply_hebbian_lora(float* out, const float* A, const float* B,
+                               const float* x, int dim, int rank){
+    float proj[RANK];
+    for(int r=0;r<rank;r++){ float s=0;
+        for(int j=0;j<dim;j++) s+=A[j*rank+r]*x[j]; proj[r]=s; }
+    for(int i=0;i<dim;i++){ float s=0;
+        for(int r=0;r<rank;r++) s+=B[r*dim+i]*proj[r]; out[i]+=s; }
+}
+/* update (the δ in θ=ε+γ+αδ): A += lr·signal·(x ⊗ Bᵀdy); B += lr·signal·(Aᵀx ⊗ dy);
+ * then weight decay.  notorch.c:2683, naive path verbatim — stack, ASan-clean. */
+static void nt_hebbian_step(float* A, float* B, int out_dim, int in_dim, int rank,
+                            const float* x, const float* dy, float signal,
+                            float lr, float decay){
+    if(!A||!B||!x||!dy) return;
+    float proj[RANK];
+    for(int r=0;r<rank;r++){ float s=0;
+        for(int j=0;j<out_dim;j++) s+=B[r*out_dim+j]*dy[j]; proj[r]=s; }
+    float alpha=lr*signal;
+    for(int i=0;i<in_dim;i++)
+        for(int r=0;r<rank;r++) A[i*rank+r]+=alpha*x[i]*proj[r];
+    float proj2[RANK];
+    for(int r=0;r<rank;r++){ float s=0;
+        for(int i=0;i<in_dim;i++) s+=A[i*rank+r]*x[i]; proj2[r]=s; }
+    for(int r=0;r<rank;r++)
+        for(int j=0;j<out_dim;j++) B[r*out_dim+j]+=alpha*proj2[r]*dy[j];
+    if(decay>0.0f&&decay<1.0f){
+        for(int i=0;i<in_dim*rank;i++) A[i]*=decay;
+        for(int i=0;i<rank*out_dim;i++) B[i]*=decay;
+    }
+}
 
 /* ── init — xavier-ish ── */
 static void xavier(float* w, int len, int fan_in){
@@ -270,6 +316,9 @@ static Model* model_new(void){
         xavier(y->wo,E*E,E); for(int i=0;i<E*E;i++) y->wo[i]*=sr/0.1f;
         xavier(y->fc1,FFN*E,E);
         xavier(y->fc2,E*FFN,FFN); for(int i=0;i<E*FFN;i++) y->fc2[i]*=sr/0.1f;
+        /* seed Hebbian A_v ~ N(0,1e-3): unlock the zero-lock fixed point (both
+         * factors zero → ΔB≡0 forever). B_v stays 0 from calloc. */
+        for(int i=0;i<E*RANK;i++) y->heb_A_v[i]=gauss(0.0f,1e-3f);
     }
     for(int i=0;i<E;i++) m->rmsf[i]=1.0f;
     xavier(m->head,VOCAB*E,E);
@@ -287,7 +336,8 @@ static void forward(Model* m, const int* toks, int n, float* out){
         for(int t=0;t<n;t++) rmsnorm(x[t],y->rms1,xn[t],E);
         for(int t=0;t<n;t++){ matvec(y->wq,xn[t],q[t],E,E);
                               matvec(y->wk,xn[t],k[t],E,E);
-                              matvec(y->wv,xn[t],v[t],E,E); }
+                              matvec(y->wv,xn[t],v[t],E,E);
+                              apply_hebbian_lora(v[t],y->heb_A_v,y->heb_B_v,xn[t],E,RANK); }
         /* multi-head causal attention */
         for(int t=0;t<n;t++) for(int h=0;h<NH;h++){
             int off=h*HD; float sc[CTX], mx=-1e30f;
@@ -308,45 +358,79 @@ static void forward(Model* m, const int* toks, int n, float* out){
     matvec(m->head,xf,out,VOCAB,E);
 }
 
+/* digest a line: perceive it (forward), then learn it into the living V-adapters
+ * (Hebbian, no backprop). returns Σ|ΔB_v| — the metabolic yield = how much the
+ * organism CHANGED on eating, not how well it already knew it. (Yield on the
+ * derivative of competence kills immortality on a mastered corpus.) */
+static float digest(Model* m, const int* glyphs, int n){
+    static float logits[VOCAB];
+    forward(m,glyphs,n,logits);          /* perception, modulated by current adapters */
+    static float before[RANK*E];
+    float dB=0.0f;
+    for(int l=0;l<NL;l++){
+        Layer* y=&m->L[l];
+        for(int g=0;g<n;g++){
+            int id=glyphs[g];
+            if(id<0||id>=VOCAB) continue;
+            const float* x_emb=m->wte+(size_t)id*E;   /* x = dy = the glyph's embedding */
+            memcpy(before,y->heb_B_v,sizeof(before));
+            nt_hebbian_step(y->heb_A_v,y->heb_B_v,E,E,RANK,
+                            x_emb,x_emb,PASSIVE_SIGNAL,HEBBIAN_LR,HEBBIAN_DECAY);
+            for(int i=0;i<RANK*E;i++) dB+=fabsf(y->heb_B_v[i]-before[i]);
+        }
+    }
+    return dB;
+}
+
 static const char* glyph_name(int id){
     if(id<GLYPH_COUNT) return GLYPH_NAMES[id];
     if(id==BOS_ID) return "BOS";
     return "MASK";
 }
 
-/* ── main — Phase A step 1: the mortal clock (no metabolism yet) ── */
+/* ── main — Phase A step 2: the breathing mortal clock (metabolism + death) ── */
 int main(int argc, char** argv){
-    seed_rng(argc>1 ? strtoul(argv[1],NULL,10) : 42UL);
+    unsigned long seed = argc>1 ? strtoul(argv[1],NULL,10) : 42UL;
+    seed_rng(seed);
     Model* m=model_new();
     long params=(long)(sizeof(Model)/sizeof(float));
 
-    /* birth: one perception of the world through the semantic membrane */
-    char first[]="the sun is fire and i feel fear in the dark";
-    int toks[CTX]; int n=semtok_line(first,toks,CTX);
-    if(n<1){ toks[0]=BOS_ID; n=1; }
-    float logits[VOCAB]; forward(m,toks,n,logits);
-    int best=0; for(int i=1;i<VOCAB;i++) if(logits[i]>logits[best]) best=i;
+    printf("nanolife — a mortal clock that can eat.  seed=%lu\n",seed);
+    printf("  params=%ld  vocab=%d  E=%d L=%d H=%d ctx=%d  yield=%.1f rent=%.4f\n",
+           params,VOCAB,E,NL,NH,CTX,(double)DIGEST_YIELD,(double)RENT);
 
-    printf("nanolife — a mortal clock wakes.\n");
-    printf("  params=%ld  vocab=%d  E=%d L=%d H=%d ctx=%d\n",params,VOCAB,E,NL,NH,CTX);
-    printf("  first breath: ate %d glyphs (",n);
-    for(int i=0;i<n;i++) printf("%s%s",i?" ":"",glyph_name(toks[i]));
-    printf(") -> %s\n",glyph_name(best));
-    printf("  no food in the room yet. it will die of pure time.\n\n");
+    /* birth: one perception of the world through the membrane (keeps the
+     * speak-path warm — the organism needs glyph_name when it talks). */
+    { int t[CTX]; int bn=semtok_line("the sun is fire and i feel fear in the dark",t,CTX);
+      if(bn<1){ t[0]=BOS_ID; bn=1; }
+      printf("  first breath:"); for(int i=0;i<bn;i++) printf(" %s",glyph_name(t[i])); printf("\n\n"); }
 
-    /* the mortal clock: rent on existence, a loop that exits when life runs out.
-     * no metabolism wired yet (that is step A2) — so it is GUARANTEED to starve,
-     * and the program ends because the creature died, not on a return 0. */
+    FILE* food=fopen("lifeisshit/world.txt","r");
+    if(!food){ printf("  no world to eat (lifeisshit/world.txt). да будет так.\n"); free(m); return 1; }
+
+    /* the breathing mortal clock: rent gnaws every tick; eating a glyph that
+     * MOVES the living V-adapters (|ΔB_v|) postpones death. food runs out ->
+     * only rent remains -> the loop exits on its own. one scalar carries both
+     * metabolism and death. */
     float energy=E_BORN;
     long  tick=0;
-    while(energy > 0.0f){
+    char  line[4096];
+    int   glyphs[CTX];
+    int   fed=1;
+    while(energy>0.0f){
         tick++;
-        energy -= RENT;                 /* only ever subtracts: time is one-way */
-        if(tick % 100 == 0) printf("  tick %4ld   energy %+.4f\n",tick,energy);
+        energy-=RENT;                          /* rent: the one-way arrow */
+        float dB=0.0f;
+        if(fed && fgets(line,sizeof(line),food)){
+            int n=semtok_line(line,glyphs,CTX);
+            if(n>=1){ dB=digest(m,glyphs,n); energy+=DIGEST_YIELD*dB; }
+        } else fed=0;                           /* corpus exhausted -> starvation */
+        if(tick<=30 || tick%100==0)
+            printf("  t%-6ld E%+.5f  dB %.3e  %s\n",tick,energy,dB,fed?"eat":"STARVE");
     }
-    printf("\n  died at tick %ld — the loop exited on its own.\n",tick);
-    printf("  a creature that ran out of time, not a return 0. да будет так.\n");
-
+    printf("\n  died at tick %ld — %s.  да будет так.\n",
+           tick, fed?"starved mid-meal (yield too weak / mastered)":"ate the world, then ran out of time");
+    fclose(food);
     free(m);
     return 0;
 }
