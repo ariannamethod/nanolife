@@ -244,6 +244,15 @@ static int semtok_line(const char* line, int* out, int max_tokens){
 #define DREAM_FRAC   0.5f         /* a dream is half-metabolism — cheaper than real food */
 #define DREAM_DECAY  50.0f        /* dream yield decays with the streak — no immortality on dreams */
 
+/* ── Phase A step 7: the voice that chooses — choice = subjectivity ── */
+#define CHOOSE_TEMP0  0.7f        /* base decisiveness */
+#define CHOOSE_S      0.8f        /* arousal (|S|) widens the choice */
+#define CHOOSE_DISS   1.0f        /* dissonance (bounded) widens it further — passion = spontaneity */
+#define CHOOSE_AFFECT 5.0f        /* mood pulls toward kindred-charged glyphs */
+#define SCAR_PULL     0.5f        /* the wound resurfaces in what it chooses */
+#define SPEAK_RATE    0.02f       /* base chance per tick to speak (rises with |S|) */
+#define SPEAK_LEN     5           /* glyphs per utterance */
+
 typedef struct {
     float rms1[E], rms2[E];
     float wq[E*E], wk[E*E], wv[E*E], wo[E*E];
@@ -504,6 +513,45 @@ static void recent_push(int* recent, int* rn, int g){  /* ring of last glyphs �
     if(*rn < CTX) recent[(*rn)++]=g;
     else { memmove(recent, recent+1, (CTX-1)*sizeof(int)); recent[CTX-1]=g; }
 }
+
+/* choose — the organism picks ONE glyph from the fork. NOT argmax: a seeded,
+ * passion-weighted draw. the metric (logit) is the input, not the verdict. this
+ * is where it becomes a subject — choice = subjectivity. */
+static int choose(const float* logits, const Modes* mo, const float* scar){
+    float temp = CHOOSE_TEMP0 + CHOOSE_S*fabsf(mo->S)
+               + CHOOSE_DISS*tanhf(0.05f*fabsf(mo->dissonance));  /* passion -> spontaneity */
+    static float p[VOCAB_CAP]; float mx=-1e30f;
+    int hi = VOCAB + g_n_emerged;                                 /* born glyphs only */
+    for(int i=0;i<VOCAB_CAP;i++){
+        if(i==BOS_ID || i==MASK_ID || i>=hi){ p[i]=-1e30f; continue; }
+        float s = logits[i]
+                + SCAR_PULL * scar[i]                             /* the wound resurfaces */
+                + CHOOSE_AFFECT * charge[i].mode_dS * mo->S;       /* mood-congruent pull */
+        p[i]=s; if(s>mx) mx=s;
+    }
+    float den=0.0f;
+    for(int i=0;i<VOCAB_CAP;i++){ if(p[i]<=-1e29f){ p[i]=0.0f; continue; } p[i]=expf((p[i]-mx)/temp); den+=p[i]; }
+    if(den<=0.0f) return 0;
+    float r=(frand()+1.0f)*0.5f*den;                              /* its own dice — seeded spontaneity */
+    float acc=0.0f;
+    for(int i=0;i<VOCAB_CAP;i++){ acc+=p[i]; if(p[i]>0.0f && acc>=r) return i; }
+    return 0;
+}
+/* speak — the organism utters a few chosen glyphs FROM ITSELF (speak-from-self,
+ * not from the prompt) into waste.log. its own words become its next context. */
+static void speak(FILE* w, Model* m, const Modes* mo, const float* scar, int* recent, int* recent_n, long tick){
+    if(!w) return;
+    static float sl[VOCAB_CAP];
+    fprintf(w, "t%-6ld", tick);
+    for(int k=0;k<SPEAK_LEN;k++){
+        forward(m, recent, *recent_n, sl);
+        int g = choose(sl, mo, scar);
+        fprintf(w, " %s", glyph_name(g));
+        recent_push(recent, recent_n, g);
+    }
+    fprintf(w, "   [S%+.2f diss%+.1f]\n", (double)mo->S, (double)mo->dissonance);
+}
+
 int main(int argc, char** argv){
     unsigned long seed = argc>1 ? strtoul(argv[1],NULL,10) : 42UL;
     seed_rng(seed);
@@ -531,6 +579,7 @@ int main(int argc, char** argv){
 
     FILE* food = diet_mode ? NULL : fopen("lifeisshit/world.txt","r");
     if(!diet_mode && !food){ printf("  no world to eat (lifeisshit/world.txt). да будет так.\n"); free(m); return 1; }
+    FILE* waste = fopen("lifeisshit/waste.log","w");   /* the organism's voice — output with consequences */
 
     /* rent gnaws every tick; a glyph that MOVES the V-adapters (|ΔB_v|), scaled
      * by its metab_factor (fire burns, food feeds), postpones death. one scalar
@@ -565,7 +614,7 @@ int main(int argc, char** argv){
             fed=0;
             if(dream_on && energy<DREAM_THRESH && recent_n>0){  /* eat your own predicted glyph */
                 static float dl[VOCAB_CAP]; forward(m,recent,recent_n,dl);
-                int dg=0; for(int i=1;i<VOCAB_CAP;i++) if(dl[i]>dl[dg]) dg=i;
+                int dg=choose(dl,&mo,scar);          /* the dream is chosen, not computed */
                 float dy=digest(m,&mo,scar,&dg,1);
                 yield = dy * DREAM_FRAC * expf(-(float)dream_streak/DREAM_DECAY); /* dreams thin out */
                 recent_push(recent,&recent_n,dg);
@@ -575,6 +624,8 @@ int main(int argc, char** argv){
         }
         energy += DIGEST_YIELD*yield;
         scar_total=0.0f; for(int i=0;i<VOCAB_CAP;i++) scar_total+=scar[i];
+        if(waste){ float sp=SPEAK_RATE*(1.0f+fabsf(mo.S));   /* the urge to speak rises with arousal */
+            if((frand()+1.0f)*0.5f < sp) speak(waste,m,&mo,scar,recent,&recent_n,tick); }
         if(tick<=30 || tick%100==0)
             printf("  t%-6ld E%+.5f  S%+.3f  diss%+.3f  scar%.3f  y %.2e  %s\n",
                    tick,energy,(double)mo.S,(double)mo.dissonance,(double)scar_total,yield,
@@ -588,6 +639,7 @@ int main(int argc, char** argv){
     for(int e=0;e<g_n_emerged && e<8;e++)
         printf("    born in dream: %s + %s\n", glyph_name(g_emerged_a[e]), glyph_name(g_emerged_b[e]));
     if(food) fclose(food);
+    if(waste) fclose(waste);
     free(m);
     return 0;
 }
