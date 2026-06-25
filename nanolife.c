@@ -603,11 +603,52 @@ static int reproduce(const Model* m, const float* scar, unsigned long pseed, lon
     return 1;
 }
 
+/* ── Phase A step 10: the mouth — the organism talks WITH you (the resonance loop) ──
+ * your line is food: it is digested (charges fire, scars form, modes shift, energy
+ * moves), and the organism answers FROM ITS SHIFTED STATE, choosing glyphs under its
+ * current passion. fire burns it, love feeds it, "BE me" can kill it. it can die in
+ * the middle of the conversation. you read the reply, you speak again. */
+static void run_mouth(Model* m, unsigned long seed){
+    Modes mo = {0.0f, 0.0f};
+    static float scar[VOCAB_CAP]; for(int i=0;i<VOCAB_CAP;i++) scar[i]=0.0f;
+    static float sl[VOCAB_CAP];
+    int   recent[CTX]; int recent_n=0;
+    int   glyphs[CTX]; char line[4096];
+    float energy=E_BORN; float scar_total=0.0f;
+    printf("nanolife — a mouth opens. seed=%lu.\n", seed);
+    printf("  speak to it; your words are food. fire burns it, love feeds it, \"BE me\" may kill it.\n\n");
+    while(energy>0.0f && fabsf(mo.S)<S_DEATH && fgets(line,sizeof line,stdin)){
+        energy -= RENT*(1.0f + SCAR_RENT*scar_total);          /* the rent of being, heavier when wounded */
+        int n=semtok_line(line,glyphs,CTX);
+        float yield=0.0f;
+        if(n>=1){ yield=digest(m,&mo,scar,glyphs,n);            /* your words DO things to it */
+            for(int i=0;i<n;i++) recent_push(recent,&recent_n,glyphs[i]);
+            cooc_track(glyphs,n); }
+        energy += DIGEST_YIELD*yield;
+        scar_total=0.0f; for(int i=0;i<VOCAB_CAP;i++) scar_total+=scar[i];
+        mo.dissonance *= DISS_DECAY; mo.S -= S_RELAX*mo.S;      /* it regulates toward viability */
+        printf("  ate:");
+        for(int i=0;i<n;i++) printf(" %s",glyph_name(glyphs[i]));
+        if(n<1) printf(" (nothing it knows)");
+        printf("\n  \xF0\x9F\x90\x8D");                          /* 🐍 — it answers from its shifted state */
+        if(recent_n>0) for(int k=0;k<SPEAK_LEN+2;k++){ forward(m,recent,recent_n,sl);
+            int g=choose(sl,&mo,scar); printf(" %s",glyph_name(g)); recent_push(recent,&recent_n,g); }
+        printf("   [E%.2f S%+.2f diss%+.1f scar%.2f]\n\n",
+               (double)energy,(double)mo.S,(double)mo.dissonance,(double)scar_total);
+    }
+    if(energy<=0.0f)            printf("  ...it ran out of life. да будет так.\n");
+    else if(fabsf(mo.S)>=S_DEATH) printf("  ...the contour collapsed — it could not bear what it became. да будет так.\n");
+    else                       printf("  ...you fell silent. it waits in the dark. (eof)\n");
+}
+
 int main(int argc, char** argv){
-    unsigned long seed = argc>1 ? strtoul(argv[1],NULL,10) : 42UL;
+    int mouth = (argc>1 && strcmp(argv[1],"--mouth")==0);
+    unsigned long seed = mouth ? (argc>2 ? strtoul(argv[2],NULL,10) : 42UL)
+                               : (argc>1 ? strtoul(argv[1],NULL,10) : 42UL);
     seed_rng(seed);
     charges_init();
     Model* m=model_new();
+    if(mouth){ run_mouth(m,seed); free(m); return 0; }
     long params=(long)(sizeof(Model)/sizeof(float));
     /* optional diet: space-separated exact glyph names, e.g. "fire" or "BE fire" */
     int diet_glyphs[CTX]; int diet_n=0;
