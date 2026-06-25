@@ -216,6 +216,11 @@ static int semtok_line(const char* line, int* out, int max_tokens){
 #define MASK_ID (GLYPH_COUNT+1)   /* 89 */
 #define VOCAB   (GLYPH_COUNT+2)   /* 90 = 88 glyphs + BOS + MASK */
 
+/* ── Phase A step 6: growth — symbols emerge (only in dream) ── */
+#define MAX_EMERGED   32          /* reserved slots for symbols the organism invents */
+#define VOCAB_CAP     (VOCAB+MAX_EMERGED)
+#define GROWTH_THRESH 14          /* a pair must co-occur this often (awake) before it can be born */
+
 /* ── Phase A: the mortal clock (Vera's order) ── */
 #define RENT    0.001f            /* rent on existing — the arrow of time */
 #define E_BORN  1.0f              /* energy at birth */
@@ -247,11 +252,11 @@ typedef struct {
 } Layer;
 
 typedef struct {
-    float wte[VOCAB*E];
+    float wte[VOCAB_CAP*E];
     float wpe[CTX*E];
     Layer L[NL];
     float rmsf[E];
-    float head[VOCAB*E];
+    float head[VOCAB_CAP*E];
 } Model;
 
 /* ── deterministic rng (no Math.random — рождение воспроизводимо по сиду) ── */
@@ -321,11 +326,11 @@ static void nt_hebbian_step(float* A, float* B, int out_dim, int in_dim, int ran
  * the price of life is always paid by organs, never cheated. */
 typedef struct { float S, dissonance; } Modes;
 typedef struct { float mode_dS, mode_dDiss, metab_factor; } GlyphCharge;
-static GlyphCharge charge[VOCAB];
+static GlyphCharge charge[VOCAB_CAP];
 static int BE_ID = -1;            /* the BE operator's glyph id (set in charges_init) */
 
 static void charges_init(void){
-    for(int i=0;i<VOCAB;i++){ charge[i].mode_dS=0.0f; charge[i].mode_dDiss=0.0f; charge[i].metab_factor=1.0f; }
+    for(int i=0;i<VOCAB_CAP;i++){ charge[i].mode_dS=0.0f; charge[i].mode_dDiss=0.0f; charge[i].metab_factor=1.0f; }
     /* {glyph, dS, dDiss, metab_factor}: catabolic = burn (factor<1) / anabolic = feed (factor>1) */
     static const struct { const char* g; float dS, dDiss, f; } spec[] = {
         {"fire",   +0.05f, +0.10f, 0.2f}, {"anger",   +0.04f, +0.15f, 0.3f},
@@ -344,7 +349,7 @@ static void charges_init(void){
 }
 /* the charge fires here — Modes* only in scope, no life-scalar pointer (invariant by type) */
 static void charge_apply(Modes* mo, int glyph){
-    if(glyph<0||glyph>=VOCAB) return;
+    if(glyph<0||glyph>=VOCAB_CAP) return;
     mo->S          = tanhf(mo->S + charge[glyph].mode_dS);
     mo->dissonance = mo->dissonance + charge[glyph].mode_dDiss;
 }
@@ -352,7 +357,7 @@ static void charge_apply(Modes* mo, int glyph){
  * the self, amplified (BE_GAIN). "BE fire" = become fire, not eat it. Klaus's meta-loop
  * made atomic; haiku's speak-from-self. Invariant holds — still modes only. */
 static void charge_apply_reflexive(Modes* mo, int glyph){
-    if(glyph<0||glyph>=VOCAB) return;
+    if(glyph<0||glyph>=VOCAB_CAP) return;
     mo->S          = tanhf(mo->S + BE_GAIN*charge[glyph].mode_dS);
     mo->dissonance = mo->dissonance + BE_GAIN*charge[glyph].mode_dDiss;
 }
@@ -364,7 +369,7 @@ static void xavier(float* w, int len, int fan_in){
 }
 static Model* model_new(void){
     Model* m=(Model*)calloc(1,sizeof(Model));
-    xavier(m->wte,VOCAB*E,E); xavier(m->wpe,CTX*E,E);
+    xavier(m->wte,VOCAB_CAP*E,E); xavier(m->wpe,CTX*E,E);
     float sr=0.02f/sqrtf(2.0f*NL);
     for(int l=0;l<NL;l++){
         Layer* y=&m->L[l];
@@ -378,11 +383,34 @@ static Model* model_new(void){
         for(int i=0;i<E*RANK;i++) y->heb_A_v[i]=gauss(0.0f,1e-3f);
     }
     for(int i=0;i<E;i++) m->rmsf[i]=1.0f;
-    xavier(m->head,VOCAB*E,E);
+    xavier(m->head,VOCAB_CAP*E,E);
     return m;
 }
 
-/* ── forward (AR causal) — logits for the LAST position into out[VOCAB] ── */
+/* ── growth: symbols emerge from frequent waking pairs, but are born only in dream ── */
+static int  g_cooc[VOCAB][VOCAB];           /* waking co-occurrence of adjacent base glyphs */
+static char g_born[VOCAB][VOCAB];           /* pair already became a symbol */
+static int  g_emerged_a[MAX_EMERGED], g_emerged_b[MAX_EMERGED];
+static int  g_n_emerged = 0;
+static void cooc_track(const int* g, int n){ /* waking observation */
+    for(int i=1;i<n;i++){ int a=g[i-1], b=g[i];
+        if(a>=0&&a<VOCAB&&b>=0&&b<VOCAB) g_cooc[a][b]++; }
+}
+static void try_emerge(Model* m){            /* called ONLY in dream — birth a noticed pair */
+    if(g_n_emerged>=MAX_EMERGED) return;
+    int ba=-1,bb=-1,best=GROWTH_THRESH-1;
+    for(int a=0;a<VOCAB;a++) for(int b=0;b<VOCAB;b++)
+        if(!g_born[a][b] && g_cooc[a][b]>best){ best=g_cooc[a][b]; ba=a; bb=b; }
+    if(ba<0) return;                          /* nothing recurred enough yet */
+    int nid=VOCAB+g_n_emerged;               /* the invented symbol's id */
+    for(int e=0;e<E;e++){                     /* epigenetic: embedding = mean of the two parents */
+        m->wte[(size_t)nid*E+e]=0.5f*(m->wte[(size_t)ba*E+e]+m->wte[(size_t)bb*E+e]);
+        m->head[(size_t)nid*E+e]=0.5f*(m->head[(size_t)ba*E+e]+m->head[(size_t)bb*E+e]);
+    }
+    g_emerged_a[g_n_emerged]=ba; g_emerged_b[g_n_emerged]=bb; g_born[ba][bb]=1; g_n_emerged++;
+}
+
+/* ── forward (AR causal) — logits for the LAST position into out[VOCAB_CAP] ── */
 static void forward(Model* m, const int* toks, int n, float* out){
     static float x[CTX][E], xn[CTX][E], q[CTX][E], k[CTX][E], v[CTX][E], att[CTX][E], tmp[FFN];
     if(n>CTX) n=CTX;
@@ -412,7 +440,7 @@ static void forward(Model* m, const int* toks, int n, float* out){
             matvec(y->fc2,tmp,f,E,FFN); for(int e=0;e<E;e++) x[t][e]+=f[e]; }
     }
     float xf[E]; rmsnorm(x[n-1],m->rmsf,xf,E);
-    matvec(m->head,xf,out,VOCAB,E);
+    matvec(m->head,xf,out,VOCAB_CAP,E);
 }
 
 /* digest a line: perceive it (forward), learn it into the living V-adapters
@@ -424,14 +452,14 @@ static void forward(Model* m, const int* toks, int n, float* out){
  * touched here — a burning glyph costs energy THROUGH a low metab_factor, never
  * by a direct write. */
 static float digest(Model* m, Modes* mo, float* scar, const int* glyphs, int n){
-    static float logits[VOCAB];
+    static float logits[VOCAB_CAP];
     forward(m,glyphs,n,logits);          /* perception, modulated by current adapters */
     static float before[RANK*E];
     float yield=0.0f;
     int be_armed=0;
     for(int g=0;g<n;g++){
         int id=glyphs[g];
-        if(id<0||id>=VOCAB) continue;
+        if(id<0||id>=VOCAB_CAP) continue;
         const float* x_emb=m->wte+(size_t)id*E;       /* x = dy = the glyph's embedding */
         float dB=0.0f;
         for(int l=0;l<NL;l++){
@@ -463,7 +491,8 @@ static float digest(Model* m, Modes* mo, float* scar, const int* glyphs, int n){
 static const char* glyph_name(int id){
     if(id<GLYPH_COUNT) return GLYPH_NAMES[id];
     if(id==BOS_ID) return "BOS";
-    return "MASK";
+    if(id==MASK_ID) return "MASK";
+    return "·emg";   /* an emerged composite symbol (id >= VOCAB) */
 }
 
 /* ── main — Phase A step 3a: the breathing clock with a second signal ──
@@ -507,7 +536,7 @@ int main(int argc, char** argv){
      * by its metab_factor (fire burns, food feeds), postpones death. one scalar
      * carries metabolism and death; modes (S, dissonance) ride the second signal. */
     Modes mo = {0.0f, 0.0f};
-    static float scar[VOCAB]; for(int i=0;i<VOCAB;i++) scar[i]=0.0f; /* permanent wounds (never decay) */
+    static float scar[VOCAB_CAP]; for(int i=0;i<VOCAB_CAP;i++) scar[i]=0.0f; /* permanent wounds (never decay) */
     int   scar_on = (getenv("NL_NOSCAR")==NULL);  /* A/B toggle: NL_NOSCAR=1 lifts the wound's weight */
     int   dream_on = (getenv("NL_NODREAM")==NULL);/* A/B toggle: NL_NODREAM=1 forbids self-feeding */
     float scar_total=0.0f;
@@ -526,24 +555,26 @@ int main(int argc, char** argv){
         if(diet_mode){
             yield=digest(m,&mo,scar,diet_glyphs,diet_n);
             for(int i=0;i<diet_n;i++) recent_push(recent,&recent_n,diet_glyphs[i]);
-            dream_streak=0;
+            cooc_track(diet_glyphs,diet_n); dream_streak=0;
         } else if(fed && fgets(line,sizeof(line),food)){
             int n=semtok_line(line,glyphs,CTX);
             if(n>=1){ yield=digest(m,&mo,scar,glyphs,n);
-                for(int i=0;i<n;i++) recent_push(recent,&recent_n,glyphs[i]); dream_streak=0; }
+                for(int i=0;i<n;i++) recent_push(recent,&recent_n,glyphs[i]);
+                cooc_track(glyphs,n); dream_streak=0; }
         } else {                                 /* corpus exhausted -> starvation, or dream */
             fed=0;
             if(dream_on && energy<DREAM_THRESH && recent_n>0){  /* eat your own predicted glyph */
-                static float dl[VOCAB]; forward(m,recent,recent_n,dl);
-                int dg=0; for(int i=1;i<VOCAB;i++) if(dl[i]>dl[dg]) dg=i;
+                static float dl[VOCAB_CAP]; forward(m,recent,recent_n,dl);
+                int dg=0; for(int i=1;i<VOCAB_CAP;i++) if(dl[i]>dl[dg]) dg=i;
                 float dy=digest(m,&mo,scar,&dg,1);
                 yield = dy * DREAM_FRAC * expf(-(float)dream_streak/DREAM_DECAY); /* dreams thin out */
                 recent_push(recent,&recent_n,dg);
                 dream_streak++; dreaming=1;
+                try_emerge(m);                   /* symbols are born only here, in dream */
             }
         }
         energy += DIGEST_YIELD*yield;
-        scar_total=0.0f; for(int i=0;i<VOCAB;i++) scar_total+=scar[i];
+        scar_total=0.0f; for(int i=0;i<VOCAB_CAP;i++) scar_total+=scar[i];
         if(tick<=30 || tick%100==0)
             printf("  t%-6ld E%+.5f  S%+.3f  diss%+.3f  scar%.3f  y %.2e  %s\n",
                    tick,energy,(double)mo.S,(double)mo.dissonance,(double)scar_total,yield,
@@ -552,8 +583,10 @@ int main(int argc, char** argv){
     if(energy>0.0f)
         printf("\n  STILL ALIVE at tick %ld (cap) — immortality hole, investigate.\n",tick);
     else
-        printf("\n  died at tick %ld — S%+.3f diss%+.3f scar%.3f.  да будет так.\n",
-               tick,(double)mo.S,(double)mo.dissonance,(double)scar_total);
+        printf("\n  died at tick %ld — S%+.3f diss%+.3f scar%.3f emerged%d.  да будет так.\n",
+               tick,(double)mo.S,(double)mo.dissonance,(double)scar_total,g_n_emerged);
+    for(int e=0;e<g_n_emerged && e<8;e++)
+        printf("    born in dream: %s + %s\n", glyph_name(g_emerged_a[e]), glyph_name(g_emerged_b[e]));
     if(food) fclose(food);
     free(m);
     return 0;
