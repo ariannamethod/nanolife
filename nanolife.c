@@ -260,6 +260,11 @@ static int semtok_line(const char* line, int* out, int max_tokens){
 #define REPRO_SPLIT    0.5f       /* half the life goes into the child */
 #define MAX_CHILDREN   16
 
+/* ── Phase A step 9: active homeostasis — regulate or collapse ── */
+#define DISS_DECAY  0.98f         /* dissonance returns toward calm each tick */
+#define S_RELAX     0.01f         /* mood relaxes toward neutral */
+#define S_DEATH     0.95f         /* |S| this high = contour collapse (overwhelmed by passion) */
+
 typedef struct {
     float rms1[E], rms2[E];
     float wq[E*E], wk[E*E], wv[E*E], wo[E*E];
@@ -344,6 +349,7 @@ typedef struct { float S, dissonance; } Modes;
 typedef struct { float mode_dS, mode_dDiss, metab_factor; } GlyphCharge;
 static GlyphCharge charge[VOCAB_CAP];
 static int BE_ID = -1;            /* the BE operator's glyph id (set in charges_init) */
+static int ME_ID = -1;            /* the self-glyph (BE me = the self devours itself) */
 
 static void charges_init(void){
     for(int i=0;i<VOCAB_CAP;i++){ charge[i].mode_dS=0.0f; charge[i].mode_dDiss=0.0f; charge[i].metab_factor=1.0f; }
@@ -362,6 +368,7 @@ static void charges_init(void){
     for(int i=0; spec[i].g; i++){ int id=semtok_find_glyph(spec[i].g);
         if(id>=0){ charge[id].mode_dS=spec[i].dS; charge[id].mode_dDiss=spec[i].dDiss; charge[id].metab_factor=spec[i].f; } }
     BE_ID = semtok_find_glyph("BE");
+    ME_ID = semtok_find_glyph("me");
 }
 /* the charge fires here — Modes* only in scope, no life-scalar pointer (invariant by type) */
 static void charge_apply(Modes* mo, int glyph){
@@ -374,6 +381,10 @@ static void charge_apply(Modes* mo, int glyph){
  * made atomic; haiku's speak-from-self. Invariant holds — still modes only. */
 static void charge_apply_reflexive(Modes* mo, int glyph){
     if(glyph<0||glyph>=VOCAB_CAP) return;
+    if(glyph==ME_ID){                              /* BE me — the self devours itself, toward the edge */
+        mo->S = tanhf(2.5f*mo->S + 0.9f);
+        return;
+    }
     mo->S          = tanhf(mo->S + BE_GAIN*charge[glyph].mode_dS);
     mo->dissonance = mo->dissonance + BE_GAIN*charge[glyph].mode_dDiss;
 }
@@ -627,6 +638,8 @@ int main(int argc, char** argv){
     int   recent[CTX]; int recent_n=0;            /* ring of last glyphs — the dream's context */
     long  dream_streak=0;
     long  last_repro=-REPRO_COOLDOWN;
+    int   homeo_on=(getenv("NL_NOHOMEO")==NULL);  /* A/B toggle: NL_NOHOMEO=1 lets passion run away */
+    int   contour_died=0;
     float energy=E_BORN;
     long  tick=0;
     char  line[4096];
@@ -660,6 +673,8 @@ int main(int argc, char** argv){
         }
         energy += DIGEST_YIELD*yield;
         scar_total=0.0f; for(int i=0;i<VOCAB_CAP;i++) scar_total+=scar[i];
+        if(homeo_on){ mo.dissonance *= DISS_DECAY; mo.S -= S_RELAX*mo.S; }  /* regulate toward viability */
+        if(fabsf(mo.S) >= S_DEATH){ contour_died=1; break; }               /* overwhelmed: the contour melts */
         if(waste){ float sp=SPEAK_RATE*(1.0f+fabsf(mo.S));   /* the urge to speak rises with arousal */
             if((frand()+1.0f)*0.5f < sp) speak(waste,m,&mo,scar,recent,&recent_n,tick); }
         if(energy > REPRO_THRESH && tick - last_repro > REPRO_COOLDOWN){  /* too full -> split */
@@ -670,11 +685,12 @@ int main(int argc, char** argv){
                    tick,energy,(double)mo.S,(double)mo.dissonance,(double)scar_total,yield,
                    (dreaming?"DREAM":(diet_mode?"diet":(fed?"eat":"STARVE"))));
     }
-    if(energy>0.0f)
+    if(!contour_died && energy>0.0f)
         printf("\n  STILL ALIVE at tick %ld (cap) — immortality hole, investigate.\n",tick);
     else
-        printf("\n  died at tick %ld — S%+.3f diss%+.3f scar%.3f emerged%d children%d.  да будет так.\n",
-               tick,(double)mo.S,(double)mo.dissonance,(double)scar_total,g_n_emerged,g_n_children);
+        printf("\n  died at tick %ld (%s) — S%+.3f diss%+.3f scar%.3f emerged%d children%d.  да будет так.\n",
+               tick, contour_died?"contour collapse":"ran out of time",
+               (double)mo.S,(double)mo.dissonance,(double)scar_total,g_n_emerged,g_n_children);
     for(int e=0;e<g_n_emerged && e<8;e++)
         printf("    born in dream: %s + %s\n", glyph_name(g_emerged_a[e]), glyph_name(g_emerged_b[e]));
     if(food) fclose(food);
