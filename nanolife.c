@@ -226,6 +226,8 @@ static int semtok_line(const char* line, int* out, int max_tokens){
 #define HEBBIAN_DECAY  0.9999f    /* canon cavellman.c:424 */
 #define PASSIVE_SIGNAL 0.3f       /* reading the world = passive (cavellman.c:654) */
 #define DIGEST_YIELD   80.0f      /* energy per unit |ΔB_v| — calibrated: avg dB~2e-5, break-even~50 */
+#define BE_GAIN        3.0f       /* BE turns the next glyph's charge inward, amplified */
+#define BE_INTENSITY   2.0f       /* BE intensifies the glyph's metabolic nature (becoming costs) */
 
 typedef struct {
     float rms1[E], rms2[E];
@@ -310,6 +312,7 @@ static void nt_hebbian_step(float* A, float* B, int out_dim, int in_dim, int ran
 typedef struct { float S, dissonance; } Modes;
 typedef struct { float mode_dS, mode_dDiss, metab_factor; } GlyphCharge;
 static GlyphCharge charge[VOCAB];
+static int BE_ID = -1;            /* the BE operator's glyph id (set in charges_init) */
 
 static void charges_init(void){
     for(int i=0;i<VOCAB;i++){ charge[i].mode_dS=0.0f; charge[i].mode_dDiss=0.0f; charge[i].metab_factor=1.0f; }
@@ -322,17 +325,26 @@ static void charges_init(void){
         {"food",   +0.02f, -0.10f, 2.0f}, {"water",   +0.01f, -0.08f, 1.8f},
         {"sleep",  -0.01f, -0.15f, 1.5f}, {"joy",     +0.06f, -0.12f, 1.6f},
         {"love",   +0.08f, -0.15f, 1.7f}, {"music",   +0.05f, -0.10f, 1.4f},
-        {"good",   +0.04f, -0.08f, 1.3f},
+        {"good",   +0.04f, -0.08f, 1.3f}, {"me",      +0.03f,  0.00f, 1.0f},
         {NULL,0,0,0}
     };
     for(int i=0; spec[i].g; i++){ int id=semtok_find_glyph(spec[i].g);
         if(id>=0){ charge[id].mode_dS=spec[i].dS; charge[id].mode_dDiss=spec[i].dDiss; charge[id].metab_factor=spec[i].f; } }
+    BE_ID = semtok_find_glyph("BE");
 }
 /* the charge fires here — Modes* only in scope, no life-scalar pointer (invariant by type) */
 static void charge_apply(Modes* mo, int glyph){
     if(glyph<0||glyph>=VOCAB) return;
     mo->S          = tanhf(mo->S + charge[glyph].mode_dS);
     mo->dissonance = mo->dissonance + charge[glyph].mode_dDiss;
+}
+/* BE — the reflexive operator: the charge of the glyph AFTER be is turned inward, on
+ * the self, amplified (BE_GAIN). "BE fire" = become fire, not eat it. Klaus's meta-loop
+ * made atomic; haiku's speak-from-self. Invariant holds — still modes only. */
+static void charge_apply_reflexive(Modes* mo, int glyph){
+    if(glyph<0||glyph>=VOCAB) return;
+    mo->S          = tanhf(mo->S + BE_GAIN*charge[glyph].mode_dS);
+    mo->dissonance = mo->dissonance + BE_GAIN*charge[glyph].mode_dDiss;
 }
 
 /* ── init — xavier-ish ── */
@@ -406,6 +418,7 @@ static float digest(Model* m, Modes* mo, const int* glyphs, int n){
     forward(m,glyphs,n,logits);          /* perception, modulated by current adapters */
     static float before[RANK*E];
     float yield=0.0f;
+    int be_armed=0;
     for(int g=0;g<n;g++){
         int id=glyphs[g];
         if(id<0||id>=VOCAB) continue;
@@ -418,8 +431,17 @@ static float digest(Model* m, Modes* mo, const int* glyphs, int n){
                             x_emb,x_emb,PASSIVE_SIGNAL,HEBBIAN_LR,HEBBIAN_DECAY);
             for(int i=0;i<RANK*E;i++) dB+=fabsf(y->heb_B_v[i]-before[i]);
         }
-        yield += dB * charge[id].metab_factor;        /* cost/gain paid through metabolism */
-        charge_apply(mo,id);                          /* second signal: modes only */
+        float f=charge[id].metab_factor;
+        if(id==BE_ID){                                /* the operator is not a meal — arms reflexivity, yields nothing */
+            be_armed=1; (void)f;
+        } else if(be_armed){                          /* "BE X": become X — charge turned inward, amplified */
+            charge_apply_reflexive(mo,id);
+            yield += dB * (1.0f + BE_INTENSITY*(f-1.0f)); /* becoming intensifies the metabolic nature */
+            be_armed=0;
+        } else {                                      /* plain X: charge acts outward */
+            charge_apply(mo,id);
+            yield += dB*f;                            /* cost/gain paid through metabolism */
+        }
     }
     return yield;
 }
@@ -441,11 +463,17 @@ int main(int argc, char** argv){
     charges_init();
     Model* m=model_new();
     long params=(long)(sizeof(Model)/sizeof(float));
-    const char* diet = argc>2 ? argv[2] : NULL;
-    int diet_id = diet ? semtok_find_glyph(diet) : -1;
+    /* optional diet: space-separated exact glyph names, e.g. "fire" or "BE fire" */
+    int diet_glyphs[CTX]; int diet_n=0;
+    if(argc>2){
+        char dbuf[256]; strncpy(dbuf,argv[2],255); dbuf[255]='\0';
+        char* tk=strtok(dbuf," ");
+        while(tk && diet_n<CTX){ int gid=semtok_find_glyph(tk); if(gid>=0) diet_glyphs[diet_n++]=gid; tk=strtok(NULL," "); }
+    }
+    int diet_mode = diet_n>0;
 
     printf("nanolife — a mortal clock that can eat.  seed=%lu  diet=%s\n",
-           seed, (diet_id>=0?diet:"world"));
+           seed, (diet_mode? argv[2] : "world"));
     printf("  params=%ld  vocab=%d  E=%d L=%d H=%d ctx=%d  yield=%.1f rent=%.4f\n",
            params,VOCAB,E,NL,NH,CTX,(double)DIGEST_YIELD,(double)RENT);
 
@@ -454,8 +482,8 @@ int main(int argc, char** argv){
       if(bn<1){ t[0]=BOS_ID; bn=1; }
       printf("  first breath:"); for(int i=0;i<bn;i++) printf(" %s",glyph_name(t[i])); printf("\n\n"); }
 
-    FILE* food = (diet_id>=0) ? NULL : fopen("lifeisshit/world.txt","r");
-    if(diet_id<0 && !food){ printf("  no world to eat (lifeisshit/world.txt). да будет так.\n"); free(m); return 1; }
+    FILE* food = diet_mode ? NULL : fopen("lifeisshit/world.txt","r");
+    if(!diet_mode && !food){ printf("  no world to eat (lifeisshit/world.txt). да будет так.\n"); free(m); return 1; }
 
     /* rent gnaws every tick; a glyph that MOVES the V-adapters (|ΔB_v|), scaled
      * by its metab_factor (fire burns, food feeds), postpones death. one scalar
@@ -470,7 +498,7 @@ int main(int argc, char** argv){
         tick++;
         energy-=RENT;                           /* rent: the one-way arrow */
         float yield=0.0f;
-        if(diet_id>=0){ int g1[1]={diet_id}; yield=digest(m,&mo,g1,1); }   /* infinite mono-diet */
+        if(diet_mode){ yield=digest(m,&mo,diet_glyphs,diet_n); }   /* infinite diet sequence (e.g. BE fire) */
         else if(fed && fgets(line,sizeof(line),food)){
             int n=semtok_line(line,glyphs,CTX);
             if(n>=1) yield=digest(m,&mo,glyphs,n);
@@ -479,7 +507,7 @@ int main(int argc, char** argv){
         if(tick<=30 || tick%100==0)
             printf("  t%-6ld E%+.5f  S%+.3f  diss%+.3f  y %.2e  %s\n",
                    tick,energy,(double)mo.S,(double)mo.dissonance,yield,
-                   (diet_id>=0?"diet":(fed?"eat":"STARVE")));
+                   (diet_mode?"diet":(fed?"eat":"STARVE")));
     }
     if(energy>0.0f)
         printf("\n  STILL ALIVE at tick %ld (cap) — immortality hole, investigate.\n",tick);
