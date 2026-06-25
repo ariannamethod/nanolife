@@ -234,6 +234,11 @@ static int semtok_line(const char* line, int* out, int max_tokens){
 #define SCAR_RENT   0.5f          /* total scar raises rent — a wounded organism burns faster */
 #define ACHE        0.05f         /* a scarred glyph aches on contact — the wound returns */
 
+/* ── Phase A step 5: dream — self-ingestion when starving (Klaus's meta-loop) ── */
+#define DREAM_THRESH 0.6f         /* dream only when hungry (energy below this) */
+#define DREAM_FRAC   0.5f         /* a dream is half-metabolism — cheaper than real food */
+#define DREAM_DECAY  50.0f        /* dream yield decays with the streak — no immortality on dreams */
+
 typedef struct {
     float rms1[E], rms2[E];
     float wq[E*E], wk[E*E], wv[E*E], wo[E*E];
@@ -466,6 +471,10 @@ static const char* glyph_name(int id){
  *   no diet  -> eats lifeisshit/world.txt line by line, then starves.
  *   diet     -> an infinite mono-glyph diet (e.g. fire / food) for A/B: does
  *               the charge bend life differently at the SAME weights? */
+static void recent_push(int* recent, int* rn, int g){  /* ring of last glyphs — the dream's context */
+    if(*rn < CTX) recent[(*rn)++]=g;
+    else { memmove(recent, recent+1, (CTX-1)*sizeof(int)); recent[CTX-1]=g; }
+}
 int main(int argc, char** argv){
     unsigned long seed = argc>1 ? strtoul(argv[1],NULL,10) : 42UL;
     seed_rng(seed);
@@ -500,7 +509,10 @@ int main(int argc, char** argv){
     Modes mo = {0.0f, 0.0f};
     static float scar[VOCAB]; for(int i=0;i<VOCAB;i++) scar[i]=0.0f; /* permanent wounds (never decay) */
     int   scar_on = (getenv("NL_NOSCAR")==NULL);  /* A/B toggle: NL_NOSCAR=1 lifts the wound's weight */
+    int   dream_on = (getenv("NL_NODREAM")==NULL);/* A/B toggle: NL_NODREAM=1 forbids self-feeding */
     float scar_total=0.0f;
+    int   recent[CTX]; int recent_n=0;            /* ring of last glyphs — the dream's context */
+    long  dream_streak=0;
     float energy=E_BORN;
     long  tick=0;
     char  line[4096];
@@ -510,17 +522,32 @@ int main(int argc, char** argv){
         tick++;
         energy -= RENT * (1.0f + (scar_on? SCAR_RENT*scar_total : 0.0f)); /* wounds make rent heavier */
         float yield=0.0f;
-        if(diet_mode){ yield=digest(m,&mo,scar,diet_glyphs,diet_n); }   /* infinite diet sequence (e.g. BE fire) */
-        else if(fed && fgets(line,sizeof(line),food)){
+        int   dreaming=0;
+        if(diet_mode){
+            yield=digest(m,&mo,scar,diet_glyphs,diet_n);
+            for(int i=0;i<diet_n;i++) recent_push(recent,&recent_n,diet_glyphs[i]);
+            dream_streak=0;
+        } else if(fed && fgets(line,sizeof(line),food)){
             int n=semtok_line(line,glyphs,CTX);
-            if(n>=1) yield=digest(m,&mo,scar,glyphs,n);
-        } else fed=0;                            /* corpus exhausted -> starvation */
+            if(n>=1){ yield=digest(m,&mo,scar,glyphs,n);
+                for(int i=0;i<n;i++) recent_push(recent,&recent_n,glyphs[i]); dream_streak=0; }
+        } else {                                 /* corpus exhausted -> starvation, or dream */
+            fed=0;
+            if(dream_on && energy<DREAM_THRESH && recent_n>0){  /* eat your own predicted glyph */
+                static float dl[VOCAB]; forward(m,recent,recent_n,dl);
+                int dg=0; for(int i=1;i<VOCAB;i++) if(dl[i]>dl[dg]) dg=i;
+                float dy=digest(m,&mo,scar,&dg,1);
+                yield = dy * DREAM_FRAC * expf(-(float)dream_streak/DREAM_DECAY); /* dreams thin out */
+                recent_push(recent,&recent_n,dg);
+                dream_streak++; dreaming=1;
+            }
+        }
         energy += DIGEST_YIELD*yield;
         scar_total=0.0f; for(int i=0;i<VOCAB;i++) scar_total+=scar[i];
         if(tick<=30 || tick%100==0)
             printf("  t%-6ld E%+.5f  S%+.3f  diss%+.3f  scar%.3f  y %.2e  %s\n",
                    tick,energy,(double)mo.S,(double)mo.dissonance,(double)scar_total,yield,
-                   (diet_mode?"diet":(fed?"eat":"STARVE")));
+                   (dreaming?"DREAM":(diet_mode?"diet":(fed?"eat":"STARVE"))));
     }
     if(energy>0.0f)
         printf("\n  STILL ALIVE at tick %ld (cap) — immortality hole, investigate.\n",tick);
