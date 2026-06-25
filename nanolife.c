@@ -229,6 +229,11 @@ static int semtok_line(const char* line, int* out, int max_tokens){
 #define BE_GAIN        3.0f       /* BE turns the next glyph's charge inward, amplified */
 #define BE_INTENSITY   2.0f       /* BE intensifies the glyph's metabolic nature (becoming costs) */
 
+/* ── Phase A step 4: scar — permanent wounds (never decay) ── */
+#define SCAR_RATE   0.01f         /* how fast an agitating glyph wounds itself */
+#define SCAR_RENT   0.5f          /* total scar raises rent — a wounded organism burns faster */
+#define ACHE        0.05f         /* a scarred glyph aches on contact — the wound returns */
+
 typedef struct {
     float rms1[E], rms2[E];
     float wq[E*E], wk[E*E], wv[E*E], wo[E*E];
@@ -413,7 +418,7 @@ static void forward(Model* m, const int* toks, int n, float* out){
  * INVARIANT: the charge writes modes only (charge_apply); energy/scar are never
  * touched here — a burning glyph costs energy THROUGH a low metab_factor, never
  * by a direct write. */
-static float digest(Model* m, Modes* mo, const int* glyphs, int n){
+static float digest(Model* m, Modes* mo, float* scar, const int* glyphs, int n){
     static float logits[VOCAB];
     forward(m,glyphs,n,logits);          /* perception, modulated by current adapters */
     static float before[RANK*E];
@@ -441,6 +446,10 @@ static float digest(Model* m, Modes* mo, const int* glyphs, int n){
         } else {                                      /* plain X: charge acts outward */
             charge_apply(mo,id);
             yield += dB*f;                            /* cost/gain paid through metabolism */
+        }
+        if(id!=BE_ID){                                /* scar: agitating glyphs leave permanent wounds */
+            scar[id] += SCAR_RATE * fmaxf(0.0f, charge[id].mode_dDiss);
+            mo->dissonance += ACHE * scar[id];        /* the word hurts, therefore it returns (brodsky) */
         }
     }
     return yield;
@@ -489,6 +498,9 @@ int main(int argc, char** argv){
      * by its metab_factor (fire burns, food feeds), postpones death. one scalar
      * carries metabolism and death; modes (S, dissonance) ride the second signal. */
     Modes mo = {0.0f, 0.0f};
+    static float scar[VOCAB]; for(int i=0;i<VOCAB;i++) scar[i]=0.0f; /* permanent wounds (never decay) */
+    int   scar_on = (getenv("NL_NOSCAR")==NULL);  /* A/B toggle: NL_NOSCAR=1 lifts the wound's weight */
+    float scar_total=0.0f;
     float energy=E_BORN;
     long  tick=0;
     char  line[4096];
@@ -496,24 +508,25 @@ int main(int argc, char** argv){
     int   fed=1;
     while(energy>0.0f && tick<200000){          /* cap = falsification guard: it MUST die */
         tick++;
-        energy-=RENT;                           /* rent: the one-way arrow */
+        energy -= RENT * (1.0f + (scar_on? SCAR_RENT*scar_total : 0.0f)); /* wounds make rent heavier */
         float yield=0.0f;
-        if(diet_mode){ yield=digest(m,&mo,diet_glyphs,diet_n); }   /* infinite diet sequence (e.g. BE fire) */
+        if(diet_mode){ yield=digest(m,&mo,scar,diet_glyphs,diet_n); }   /* infinite diet sequence (e.g. BE fire) */
         else if(fed && fgets(line,sizeof(line),food)){
             int n=semtok_line(line,glyphs,CTX);
-            if(n>=1) yield=digest(m,&mo,glyphs,n);
+            if(n>=1) yield=digest(m,&mo,scar,glyphs,n);
         } else fed=0;                            /* corpus exhausted -> starvation */
         energy += DIGEST_YIELD*yield;
+        scar_total=0.0f; for(int i=0;i<VOCAB;i++) scar_total+=scar[i];
         if(tick<=30 || tick%100==0)
-            printf("  t%-6ld E%+.5f  S%+.3f  diss%+.3f  y %.2e  %s\n",
-                   tick,energy,(double)mo.S,(double)mo.dissonance,yield,
+            printf("  t%-6ld E%+.5f  S%+.3f  diss%+.3f  scar%.3f  y %.2e  %s\n",
+                   tick,energy,(double)mo.S,(double)mo.dissonance,(double)scar_total,yield,
                    (diet_mode?"diet":(fed?"eat":"STARVE")));
     }
     if(energy>0.0f)
         printf("\n  STILL ALIVE at tick %ld (cap) — immortality hole, investigate.\n",tick);
     else
-        printf("\n  died at tick %ld — S%+.3f diss%+.3f.  да будет так.\n",
-               tick,(double)mo.S,(double)mo.dissonance);
+        printf("\n  died at tick %ld — S%+.3f diss%+.3f scar%.3f.  да будет так.\n",
+               tick,(double)mo.S,(double)mo.dissonance,(double)scar_total);
     if(food) fclose(food);
     free(m);
     return 0;
