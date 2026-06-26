@@ -209,23 +209,21 @@ static int semtok_line(const char* line, int* out, int max_tokens){
 /* like semtok_line, but ALSO marks shout[i]=1 when the source word was ALL-CAPS —
  * caps is prosody, not semantics: a shouted glyph goes INWARD (reflexive). case is
  * detected BEFORE lowercasing, so "FIRE" burns inside while "fire" warms outside. */
+/* the organism is CAPS-AGNOSTIC: caps are lowercased at the door — you cannot kill
+ * this life with a single shout. shout[] is kept for ABI but is always 0; tone is not
+ * a weapon. (the death of passion stays, but it now takes obsession, not a snot.) */
 static int semtok_line_shout(const char* line, int* out, int* shout, int max_tokens){
     char buf[4096];
     strncpy(buf,line,4095); buf[4095]='\0';
-    for(int i=0;buf[i];i++){ unsigned char c=(unsigned char)buf[i];   /* strip punctuation, KEEP case */
-        if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c==' '||c=='\''||c=='-')) buf[i]=' '; }
+    for(int i=0;buf[i];i++) if(buf[i]>='A'&&buf[i]<='Z') buf[i]+=32;   /* sees caps -> lowercases them */
+    for(int i=0;buf[i];i++){ unsigned char c=(unsigned char)buf[i];
+        if(!((c>='a'&&c<='z')||(c>='0'&&c<='9')||c==' '||c=='\''||c=='-')) buf[i]=' '; }
     int n=0, last_id=-1;
-    char low[64];
     char* tok=strtok(buf," \t\n");
     while(tok && n<max_tokens){
-        int has_alpha=0, all_up=1, n_up=0;
-        for(int i=0;tok[i];i++){ char ch=tok[i];
-            if(ch>='a'&&ch<='z'){ all_up=0; has_alpha=1; } else if(ch>='A'&&ch<='Z'){ has_alpha=1; n_up++; } }
-        int sh = (has_alpha && all_up && n_up>=2);   /* a real shout needs >=2 caps — "I"/"A" are not shouts */
-        int j=0; for(;tok[j] && j<63;j++){ char ch=tok[j]; low[j]=(ch>='A'&&ch<='Z')?(char)(ch+32):ch; } low[j]='\0';
-        if(low[0]!='\0' && !semtok_is_stop_word(low)){
-            int id=semtok_word(low);
-            if(id>=0 && id!=last_id){ out[n]=id; if(shout) shout[n]=sh; n++; last_id=id; }
+        if(*tok!='\0' && !semtok_is_stop_word(tok)){
+            int id=semtok_word(tok);
+            if(id>=0 && id!=last_id){ out[n]=id; if(shout) shout[n]=0; n++; last_id=id; }
         }
         tok=strtok(NULL," \t\n");
     }
@@ -404,11 +402,11 @@ static void charge_apply(Modes* mo, int glyph){
 /* BE — the reflexive operator: the charge of the glyph AFTER be is turned inward, on
  * the self, amplified (BE_GAIN). "BE fire" = become fire, not eat it. Klaus's meta-loop
  * made atomic; haiku's speak-from-self. Invariant holds — still modes only. */
-static void charge_apply_reflexive(Modes* mo, int glyph, int shouted){
+static void charge_apply_reflexive(Modes* mo, int glyph){
     if(glyph<0||glyph>=VOCAB_CAP) return;
-    if(glyph==ME_ID && shouted){                   /* a SHOUTED self — the contour devours itself toward the edge.
-                                                    * lowercase "be me" stays mild; only "ME"/"BE ME" melts you. */
-        mo->S = tanhf(2.5f*mo->S + 0.9f);
+    if(glyph==ME_ID){                              /* the self turned inward — devours the contour, but GENTLY:
+                                                    * one "be me" -> ~0.46 (survives); sustained obsession melts it. */
+        mo->S = tanhf(1.5f*mo->S + 0.6f);
         return;
     }
     mo->S          = tanhf(mo->S + BE_GAIN*charge[glyph].mode_dS);
@@ -533,7 +531,7 @@ static float digest(Model* m, Modes* mo, float* scar, const int* glyphs, const i
         if(id==BE_ID){                                /* the operator is not a meal — arms reflexivity, yields nothing */
             be_armed=1;
         } else if(be_armed || shouted){               /* "BE X" or a shouted "X": become X — charge turned inward */
-            charge_apply_reflexive(mo,id,shouted);    /* the punch lives in the modes (×BE_GAIN), not a free yield */
+            charge_apply_reflexive(mo,id);            /* the punch lives in the modes (×BE_GAIN), not a free yield */
             yield += dB*f;                            /* honest: same metabolism as eating it outward */
             be_armed=0;
         } else {                                      /* plain x: charge acts outward */
